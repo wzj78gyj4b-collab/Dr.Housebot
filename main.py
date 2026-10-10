@@ -226,6 +226,7 @@ async def logs(m:Message):
     await m.answer("📋 Letzte Aktionen\n"+("\n".join(f"{r['at'][11:19]} {r['action']} chat={r['chat_id']} user={r['target']} {r['details']}" for r in rows) if rows else "Noch keine Protokolle."))
 @dp.message(F.chat.type.in_({"group","supergroup"}))
 async def group_guard(m:Message):
+    if not linked(m.chat.id): return
     row=group_row(m.chat)
     if m.from_user and not m.from_user.is_bot:
       user_row(m.chat.id,m.from_user.id)
