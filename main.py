@@ -9,8 +9,6 @@ from house_ai import ask_ai
 
 load_dotenv()
 TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
-ADMIN_ROOM_ID = int(os.getenv("ADMIN_ROOM_ID", "0") or 0)
-ADMIN_IDS = {int(x) for x in os.getenv("ADMIN_IDS", "").split(",") if x.strip().lstrip("-").isdigit()}
 DB_PATH = os.getenv("DATABASE_PATH", "drhousebot.sqlite3")
 if not TOKEN:
     raise RuntimeError("TELEGRAM_BOT_TOKEN fehlt. Lege es als Umgebungsvariable fest.")
@@ -23,15 +21,22 @@ spam_last = {}
 db = sqlite3.connect(DB_PATH)
 db.row_factory = sqlite3.Row
 db.executescript("""
-CREATE TABLE IF NOT EXISTS groups(chat_id INTEGER PRIMARY KEY, title TEXT, rules TEXT DEFAULT '', anti_spam INTEGER DEFAULT 1, anti_flood INTEGER DEFAULT 1, link_filter INTEGER DEFAULT 0, welcome INTEGER DEFAULT 1);
+CREATE TABLE IF NOT EXISTS groups(chat_id INTEGER PRIMARY KEY, title TEXT, owner_id INTEGER, rules TEXT DEFAULT '', anti_spam INTEGER DEFAULT 1, anti_flood INTEGER DEFAULT 1, link_filter INTEGER DEFAULT 0, welcome INTEGER DEFAULT 1);
+CREATE TABLE IF NOT EXISTS operators(user_id INTEGER PRIMARY KEY, admin_room_id INTEGER UNIQUE, created_at TEXT);
 CREATE TABLE IF NOT EXISTS users(chat_id INTEGER, user_id INTEGER, points INTEGER DEFAULT 0, style TEXT DEFAULT 'neutral', PRIMARY KEY(chat_id,user_id));
 CREATE TABLE IF NOT EXISTS warnings(chat_id INTEGER, user_id INTEGER, count INTEGER DEFAULT 0, PRIMARY KEY(chat_id,user_id));
 CREATE TABLE IF NOT EXISTS logs(id INTEGER PRIMARY KEY AUTOINCREMENT, at TEXT, actor INTEGER, chat_id INTEGER, action TEXT, target INTEGER, details TEXT);
 """)
 db.commit()
 
-def is_admin(uid:int)->bool:
-    return uid in ADMIN_IDS
+def operator(uid:int):
+    return db.execute("SELECT * FROM operators WHERE user_id=?", (uid,)).fetchone()
+def is_admin(uid:int, chat_id:int=None)->bool:
+    op=operator(uid)
+    return bool(op and (chat_id is None or op["admin_room_id"]==chat_id))
+def owner_of_group(chat_id:int):
+    row=db.execute("SELECT owner_id FROM groups WHERE chat_id=?", (chat_id,)).fetchone()
+    return row["owner_id"] if row else None
 def log_action(actor, chat_id, action, target=0, details=""):
     db.execute("INSERT INTO logs(at,actor,chat_id,action,target,details) VALUES(?,?,?,?,?,?)",
       (datetime.now(timezone.utc).isoformat(),actor,chat_id,action,target,details[:500]))
@@ -56,6 +61,15 @@ def setting_keyboard(row):
     return InlineKeyboardMarkup(inline_keyboard=[
       [InlineKeyboardButton(text=f"{'✅' if row[k] else '❌'} {v}",callback_data=f"toggle:{k}") for k,v in labels.items()],
       [InlineKeyboardButton(text="📜 Regeln setzen: /setrules Text",callback_data="noop")]])
+@dp.message(Command("setupadminroom"))
+async def setup_adminroom(m:Message):
+    if m.chat.type not in ("group","supergroup"):
+        await m.answer("Führe /setupadminroom in deiner eigenen Admin-Gruppe aus."); return
+    existing=db.execute("SELECT user_id FROM operators WHERE admin_room_id=?", (m.chat.id,)).fetchone()
+    if existing and existing["user_id"] != m.from_user.id:
+        await m.reply("Dieser Adminraum ist bereits einem anderen Betreiber zugeordnet."); return
+    db.execute("INSERT INTO operators(user_id,admin_room_id,created_at) VALUES(?,?,?) ON CONFLICT(user_id) DO UPDATE SET admin_room_id=excluded.admin_room_id", (m.from_user.id,m.chat.id,datetime.now(timezone.utc).isoformat())); db.commit()
+    await m.reply("Dein Adminraum ist registriert. Nur du kannst von hier aus deine verknüpften Gruppen verwalten. Füge jetzt Dr.Housebot in deine Zielgruppe ein und nutze dort /connect.")
 @dp.message(Command("start"))
 async def start(m:Message):
     await m.answer("Dr.Housebot online. Ich bin kein Wunderheiler. Wobei, im Vergleich zu manchen Admins …",reply_markup=menu())
@@ -96,9 +110,12 @@ async def connect(m:Message):
     if m.chat.type=="private":
         await m.answer("Führe /connect in der Zielgruppe aus; du musst dort Admin sein."); return
     member=await bot.get_chat_member(m.chat.id,m.from_user.id)
-    if member.status not in ("administrator","creator") and not is_admin(m.from_user.id):
+    if member.status not in ("administrator","creator"):
         await m.reply("Nur Gruppenadmins können diese Gruppe verknüpfen."); return
-    group_row(m.chat); log_action(m.from_user.id,m.chat.id,"connect")
+    op=operator(m.from_user.id)
+    if not op:
+        await m.reply("Registriere zuerst deinen Adminraum mit /setupadminroom dort. Dann erneut /connect hier."); return
+    db.execute("INSERT INTO groups(chat_id,title,owner_id) VALUES(?,?,?) ON CONFLICT(chat_id) DO UPDATE SET title=excluded.title, owner_id=COALESCE(groups.owner_id, excluded.owner_id)",(m.chat.id,m.chat.title or str(m.chat.id),m.from_user.id)); db.commit(); log_action(m.from_user.id,m.chat.id,"connect")
     await m.reply("Gruppe mit Dr.Housebot verknüpft. Adminraum-Befehle sind jetzt für diese Gruppe freigeschaltet.")
 @dp.message(Command("settings"))
 async def settings(m:Message):
@@ -172,18 +189,18 @@ async def rank(m:Message):
     await m.answer("🏆 Aktivitätsranking\n"+("\n".join(f"{i+1}. {r['user_id']} — {r['points']} Punkte" for i,r in enumerate(rows)) if rows else "Noch keine Aktivität erfasst."))
 @dp.message(Command("send"))
 async def send(m:Message):
-    if m.chat.id!=ADMIN_ROOM_ID or not is_admin(m.from_user.id):
+    if not is_admin(m.from_user.id,m.chat.id):
         await m.reply("Dieser Befehl ist nur für freigeschaltete Admins im konfigurierten Adminraum."); return
     text=m.text.partition(" ")[2].strip()
     if not text: await m.reply("Verwendung: /send Nachricht"); return
-    rows=db.execute("SELECT chat_id FROM groups").fetchall(); ok=0
+    rows=db.execute("SELECT chat_id FROM groups WHERE owner_id=?",(m.from_user.id,)).fetchall(); ok=0
     for row in rows:
       try: await bot.send_message(row["chat_id"],text); ok+=1
       except Exception as e: logging.warning("Send to %s failed: %s",row["chat_id"],e)
     log_action(m.from_user.id,m.chat.id,"broadcast",details=f"{ok}/{len(rows)}")
     await m.reply(f"Nachricht an {ok} von {len(rows)} verknüpften Gruppen gesendet.")
 async def admin_action(m:Message, action:str):
-    if m.chat.id!=ADMIN_ROOM_ID or not is_admin(m.from_user.id):
+    if not is_admin(m.from_user.id,m.chat.id):
         await m.reply("Nur freigeschaltete Admins im Adminraum dürfen das."); return
     parts=m.text.split(maxsplit=4)
     need=3 if action in ("warn","kick","ban","unban","unmute") else 4
@@ -191,7 +208,7 @@ async def admin_action(m:Message, action:str):
         await m.reply(f"Parameter fehlen. Beispiel: /{action} CHAT_ID USER_ID"+(" MINUTEN" if action=="mute" else "")); return
     try:
       cid=int(parts[1]); uid=int(parts[2])
-      if not linked(cid): await m.reply("Diese Chat-ID ist nicht verknüpft. Erst /connect in der Zielgruppe."); return
+      if not linked(cid) or owner_of_group(cid)!=m.from_user.id: await m.reply("Diese Gruppe ist nicht mit deinem Betreiberkonto verknüpft."); return
       reason=parts[3] if len(parts)>3 else "Keine Begründung angegeben"
       if action=="warn":
         db.execute("INSERT OR IGNORE INTO warnings(chat_id,user_id,count) VALUES(?,?,0)",(cid,uid))
@@ -221,7 +238,7 @@ for action in ("warn","mute","unmute","kick","ban","unban"):
     dp.message.register(handler,Command(action))
 @dp.message(Command("logs"))
 async def logs(m:Message):
-    if not is_admin(m.from_user.id) and m.chat.id!=ADMIN_ROOM_ID: await m.reply("Kein Zugriff."); return
+    if not is_admin(m.from_user.id,m.chat.id): await m.reply("Kein Zugriff."); return
     rows=db.execute("SELECT at,actor,chat_id,action,target,details FROM logs ORDER BY id DESC LIMIT 15").fetchall()
     await m.answer("📋 Letzte Aktionen\n"+("\n".join(f"{r['at'][11:19]} {r['action']} chat={r['chat_id']} user={r['target']} {r['details']}" for r in rows) if rows else "Noch keine Protokolle."))
 @dp.message(F.chat.type.in_({"group","supergroup"}))
