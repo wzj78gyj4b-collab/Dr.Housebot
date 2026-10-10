@@ -65,6 +65,12 @@ def setting_keyboard(row):
 async def setup_adminroom(m:Message):
     if m.chat.type not in ("group","supergroup"):
         await m.answer("Führe /setupadminroom in deiner eigenen Admin-Gruppe aus."); return
+    try:
+        member=await bot.get_chat_member(m.chat.id,m.from_user.id)
+        if member.status not in ("administrator","creator"):
+            await m.reply("Nur Admins dieser Gruppe können sie als Adminraum registrieren."); return
+    except Exception:
+        await m.reply("Ich konnte deine Adminrechte nicht prüfen. Stelle sicher, dass ich Zugriff auf die Gruppenmitglieder habe."); return
     existing=db.execute("SELECT user_id FROM operators WHERE admin_room_id=?", (m.chat.id,)).fetchone()
     if existing and existing["user_id"] != m.from_user.id:
         await m.reply("Dieser Adminraum ist bereits einem anderen Betreiber zugeordnet."); return
@@ -75,7 +81,7 @@ async def start(m:Message):
     await m.answer("Dr.Housebot online. Ich bin kein Wunderheiler. Wobei, im Vergleich zu manchen Admins …",reply_markup=menu())
 @dp.message(Command("help"))
 async def help_cmd(m:Message):
-    await m.answer("Befehle: /menu, /connect, /setrules TEXT, /rules, /rank, /stil neutral|trocken|freundlich, /ai TEXT, /wetter STADT, /zitat, /nasa. Adminraum: /send TEXT, /warn CHAT_ID USER_ID GRUND, /mute CHAT_ID USER_ID MINUTEN [GRUND], /unmute CHAT_ID USER_ID, /kick CHAT_ID USER_ID, /ban CHAT_ID USER_ID [GRUND], /unban CHAT_ID USER_ID.")
+    await m.answer("Befehle: /menu, /connect, /setupadminroom, /setrules TEXT, /rules, /rank, /stil neutral|trocken|freundlich, /ai TEXT, /wetter STADT, /zitat, /nasa. Im eigenen Adminraum: /send TEXT, /warn CHAT_ID USER_ID GRUND, /mute CHAT_ID USER_ID MINUTEN [GRUND], /unmute CHAT_ID USER_ID, /kick CHAT_ID USER_ID, /ban CHAT_ID USER_ID [GRUND], /unban CHAT_ID USER_ID.")
 @dp.message(Command("menu"))
 async def menu_cmd(m:Message):
     await m.answer("Was soll ich tun? Bitte nichts Medizinisches. Ich bin ein Bot.",reply_markup=menu())
